@@ -1,0 +1,8 @@
+name = "space-weather-rag"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = false
+
+[[routes]]
+pattern = "ask.dsremo.com"
+custom_domain = true
