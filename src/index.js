@@ -5,8 +5,10 @@
 import { CORPUS, META } from "./corpus.js";
 
 const EMB = "gemini-embedding-001";
-const GEN = "gemini-2.5-flash";
+// Try these in order; fall through on overload (503/429/5xx) so a busy model doesn't break the app.
+const GEN_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-001"];
 const TOP_K = 4;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function embedQuery(q, key) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMB}:embedContent?key=${key}`;
@@ -25,19 +27,38 @@ function topMatches(qvec, k) {
 
 async function generate(question, matches, key) {
   const context = matches.map((m, i) => `[${i + 1}] ${m.title} (source: ${m.source})\n${m.text}`).join("\n\n");
-  const prompt = `You are a careful space-weather assistant. Answer the question using ONLY the numbered context below. Cite the passages you use inline like [1] or [2]. If the answer is not in the context, say you don't have that information rather than guessing. Keep it to a short, clear paragraph.\n\nContext:\n${context}\n\nQuestion: ${question}\n\nAnswer:`;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEN}:generateContent?key=${key}`;
-  const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 900 } }) });
-  if (!r.ok) throw new Error("generate failed: " + r.status + " " + (await r.text()).slice(0, 200));
-  const data = await r.json();
-  const parts = ((data.candidates || [])[0]?.content?.parts) || [];
-  return parts.map((p) => p.text || "").join("").trim() || "(no answer)";
+  const prompt = `You are a careful space-weather assistant. Answer the question using ONLY the numbered context below. Cite the passages you use inline like [1] or [2]. If the answer is not in the context — for example a real-time forecast like "the next solar storm" — say plainly that you can't answer that from this knowledge base (and, if relevant, point to what the live dashboard or NOAA provides) rather than guessing. Keep it to a short, clear paragraph.\n\nContext:\n${context}\n\nQuestion: ${question}\n\nAnswer:`;
+  const body = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 900 } });
+  let lastErr = "";
+  for (const model of GEN_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let r;
+      try {
+        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+          { method: "POST", headers: { "content-type": "application/json" }, body });
+      } catch (e) { lastErr = `${model}: ${e.message}`; await sleep(300); continue; }
+      if (r.ok) {
+        const data = await r.json();
+        const parts = ((data.candidates || [])[0]?.content?.parts) || [];
+        const text = parts.map((p) => p.text || "").join("").trim();
+        if (text) return { answer: text, model };
+        lastErr = `${model}: empty`; break;
+      }
+      lastErr = `${model}: ${r.status}`;
+      if (r.status === 429 || r.status >= 500) { await sleep(400 * (attempt + 1)); continue; } // transient → retry
+      break; // hard error (e.g. 400) → next model
+    }
+  }
+  throw new Error(lastErr || "all models unavailable");
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><rect width="64" height="64" rx="14" fill="#F59E0B"/><circle cx="32" cy="32" r="12" fill="#fff"/></svg>`;
+    if (url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico") return new Response(FAVICON_SVG, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" } });
+    if (url.pathname === "/robots.txt") return new Response("User-agent: *\nAllow: /\nSitemap: https://ask.dsremo.com/sitemap.xml\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
+    if (url.pathname === "/sitemap.xml") return new Response('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n<url><loc>https://ask.dsremo.com/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>\n</urlset>\n', { headers: { "content-type": "application/xml; charset=utf-8" } });
     try {
       if (url.pathname === "/api/ask" && request.method === "POST") {
         if (!env.GEMINI_API_KEY) return json({ error: "model not configured" }, 503);
@@ -45,8 +66,15 @@ export default {
         if (!question || !question.trim()) return json({ error: "empty question" }, 400);
         const qvec = await embedQuery(question.trim(), env.GEMINI_API_KEY);
         const matches = topMatches(qvec, TOP_K);
-        const answer = await generate(question.trim(), matches, env.GEMINI_API_KEY);
-        return json({ answer, sources: matches.map((m) => ({ title: m.title, source: m.source, score: Number(m.score.toFixed(3)) })) });
+        const sources = matches.map((m) => ({ title: m.title, source: m.source, score: Number(m.score.toFixed(3)) }));
+        try {
+          const { answer, model } = await generate(question.trim(), matches, env.GEMINI_API_KEY);
+          return json({ answer, model, sources });
+        } catch (e) {
+          // Retrieval still succeeded — return the sources plus a friendly note so the UI never shows a raw 503.
+          return json({ busy: true, answer: "", sources,
+            note: "The answer model is briefly overloaded — your top sources are below. Please tap Ask again in a few seconds." }, 200);
+        }
       }
       if (url.pathname === "/" || url.pathname === "") return html(page());
       return new Response("Not found", { status: 404 });
@@ -64,7 +92,20 @@ function page() {
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ask Space Weather — a cited RAG assistant</title>
-<meta name="description" content="A retrieval-augmented assistant that answers space-weather questions from a curated knowledge base, with citations. Built on Cloudflare Workers + Gemini.">
+<meta name="description" content="Ask Space Weather — a cited RAG assistant answering solar-wind and space-weather questions with sources.">
+<link rel="canonical" href="https://ask.dsremo.com/">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#F59E0B">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ask Space Weather">
+<meta property="og:title" content="Ask Space Weather — a cited RAG assistant">
+<meta property="og:description" content="A cited RAG assistant answering solar-wind and space-weather questions with sources.">
+<meta property="og:url" content="https://ask.dsremo.com/">
+<meta property="og:image" content="https://ask.dsremo.com/favicon.svg">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/favicon.svg">
 <style>
   :root{--bg:#0a0e17;--panel:#121826;--line:#1f2937;--ink:#e7ecf3;--muted:#8b96a8;--accent:#a78bfa;--accent2:#6cb6ff;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.6}
@@ -109,10 +150,12 @@ function page() {
     try{
       const r=await fetch("/api/ask",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({question})});
       const d=await r.json();
-      if(d.error){ aEl.textContent="Error: "+d.error; }
+      const renderSources=(arr)=> arr&&arr.length ? '<div class="k">Sources</div>'+arr.map((s,i)=>'<div class="src">['+(i+1)+'] <b>'+s.title+'</b> — '+s.source+' <span style="opacity:.6">· match '+s.score+'</span></div>').join("") : "";
+      if(d.error){ aEl.textContent="Couldn't reach the model — please try again."; }
+      else if(d.busy){ aEl.textContent=d.note; srcEl.innerHTML=renderSources(d.sources); }
       else{
-        aEl.textContent=d.answer;
-        srcEl.innerHTML='<div class="k">Sources</div>'+d.sources.map((s,i)=>'<div class="src">['+(i+1)+'] <b>'+s.title+'</b> — '+s.source+' <span style="opacity:.6">· match '+s.score+'</span></div>').join("");
+        aEl.textContent=d.answer + (d.model? "" : "");
+        srcEl.innerHTML=renderSources(d.sources)+(d.model?'<div class="src" style="margin-top:10px;opacity:.6">answered by '+d.model+'</div>':'');
       }
     }catch(e){ aEl.textContent="Error: "+e.message; }
     go.disabled=false;
