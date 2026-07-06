@@ -101,8 +101,8 @@ function page() {
 <meta property="og:title" content="Ask Space Weather — a cited RAG assistant">
 <meta property="og:description" content="A cited RAG assistant answering solar-wind and space-weather questions with sources.">
 <meta property="og:url" content="https://ask.dsremo.com/">
-<meta property="og:image" content="https://ask.dsremo.com/favicon.svg">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="https://dsremo.com/og/ask.png">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="apple-touch-icon" href="/favicon.svg">
